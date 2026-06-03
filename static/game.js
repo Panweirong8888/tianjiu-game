@@ -162,20 +162,31 @@ class TianJiuGame {
         this.ws.send(JSON.stringify(message));
         this.addLog(`你出了 ${cards.map(c => c.name).join(' ')}`);
 
-        // 移除出过的牌
+        // 移除出过的牌（本地乐观更新）
         this.myCards = this.myCards.filter((_, i) => !this.selectedCards.includes(i));
         this.selectedCards = [];
         this.renderMyCards();
     }
 
     foldCards() {
+        if (this.selectedCards.length === 0) {
+            this.addLog('请先选择要弃掉的牌，再点击弃牌');
+            alert('请先选择要弃掉的牌，再点击弃牌');
+            return;
+        }
+
+        const cards = this.selectedCards.map(i => this.myCards[i]);
         const message = {
             type: 'fold',
-            playerId: this.playerID
+            playerId: this.playerID,
+            cards: cards
         };
 
         this.ws.send(JSON.stringify(message));
-        this.addLog('你选择了弃牌');
+        this.addLog(`你弃掉了 ${cards.map(c => c.name).join(' ')}`);
+
+        // 移除弃掉的牌（本地乐观更新）
+        this.myCards = this.myCards.filter((_, i) => !this.selectedCards.includes(i));
         this.selectedCards = [];
         this.renderMyCards();
     }
@@ -184,10 +195,18 @@ class TianJiuGame {
         switch (message.type) {
             case 'deal_cards':
                 // 从服务器接收发牌信息
-                this.myCards = message.cards;
+                this.myCards = message.cards || [];
                 this.sortCards();
                 this.renderMyCards();
                 this.addLog(`游戏开始！服务器为你分配了 ${this.myCards.length} 张牌`);
+                break;
+            case 'invalid_move':
+                {
+                    const reason = message.data && message.data.reason ? message.data.reason : '出牌无效';
+                    this.addLog(`出牌无效：${reason}`);
+                    alert(`出牌无效：${reason}`);
+                    this.flashInvalidSelection();
+                }
                 break;
             case 'round_start':
                 this.currentRound = message.round;
@@ -202,7 +221,36 @@ class TianJiuGame {
             case 'round_result':
                 this.addLog(`${message.data.playerName} 赢得了这一轮`);
                 break;
+            case 'player_win':
+                this.addLog(`${message.data.playerName} 获胜！`);
+                alert(`${message.data.playerName} 获胜！`);
+                break;
+            default:
+                this.addLog(`收到消息：${JSON.stringify(message)}`);
+                break;
         }
+    }
+
+    // 闪烁当前被选中的牌（用于提示出牌/弃牌无效）
+    flashInvalidSelection() {
+        if (!this.selectedCards || this.selectedCards.length === 0) return;
+        const original = [...this.selectedCards];
+        let flashes = 0;
+        const maxFlashes = 6;
+        const timer = setInterval(() => {
+            if (flashes % 2 === 0) {
+                this.selectedCards = []; // 隐藏选中样式
+            } else {
+                this.selectedCards = [...original]; // 恢复选中
+            }
+            this.renderMyCards();
+            flashes++;
+            if (flashes >= maxFlashes) {
+                clearInterval(timer);
+                this.selectedCards = [...original];
+                this.renderMyCards();
+            }
+        }, 160);
     }
 
     renderOtherPlayersCards() {
