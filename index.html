@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>天九游戏</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>天九游戏</h1>
+            <div class="game-info">
+                <span id="playerName">玩家: 未连接</span>
+                <span id="gameStatus">状态: 等待中</span>
+            </div>
+        </div>
+
+        <div class="game-board">
+            <!-- 其他玩家 -->
+            <div class="players-container">
+                <div class="player-position top">
+                    <div class="player-info">
+                        <div class="player-name">对家</div>
+                        <div class="player-cards" id="topPlayerCards">0张牌</div>
+                    </div>
+                    <canvas id="topPlayerCanvas" width="150" height="100"></canvas>
+                </div>
+
+                <div class="player-position left">
+                    <div class="player-info">
+                        <div class="player-name">左家</div>
+                        <div class="player-cards" id="leftPlayerCards">0张牌</div>
+                    </div>
+                    <canvas id="leftPlayerCanvas" width="100" height="150"></canvas>
+                </div>
+
+                <div class="player-position right">
+                    <div class="player-info">
+                        <div class="player-name">右家</div>
+                        <div class="player-cards" id="rightPlayerCards">0张牌</div>
+                    </div>
+                    <canvas id="rightPlayerCanvas" width="100" height="150"></canvas>
+                </div>
+            </div>
+
+            <!-- 游戏中心 -->
+            <div class="game-center">
+                <div class="table" id="gameTable"></div>
+                <div class="round-info" id="roundInfo">第1轮</div>
+            </div>
+
+            <!-- 当前玩家的手牌 -->
+            <div class="player-position bottom">
+                <canvas id="myCardsCanvas" width="800" height="150"></canvas>
+                <div class="player-controls">
+                    <button id="playBtn" class="btn btn-primary">出牌</button>
+                    <button id="foldBtn" class="btn btn-secondary">弃牌</button>
+                    <button id="clearBtn" class="btn btn-secondary">清除选择</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 游戏日志 -->
+        <div class="log-panel">
+            <h3>游戏日志</h3>
+            <div id="gameLog" class="log-content"></div>
+        </div>
+    </div>
+
+    <script src="/static/game.js"></script>
+</body>
+</html>
