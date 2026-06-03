@@ -38,6 +38,8 @@ type GameRoom struct {
 	AllCards     []Card
 	CurrentRound int
 	Banker       int
+	LastCards    []Card // 上一位玩家出的牌
+	LastPlayerID string
 	mutex        sync.RWMutex
 }
 
@@ -220,6 +222,10 @@ func (r *GameRoom) dealCards() {
 		}
 	}
 
+	// 初始化上一轮牌为空
+	r.LastCards = nil
+	r.LastPlayerID = ""
+
 	log.Printf("发牌完成！共发出 %d 张牌", cardIndex)
 	for i, p := range playerList {
 		log.Printf("玩家 %d (%s) 获得 %d 张牌", i+1, p.Name, len(p.Hand))
@@ -264,10 +270,74 @@ func (r *GameRoom) broadcast(msg GameMessage) {
 	}
 }
 
+// 从玩家手牌中移除已出的牌（按名称/类型/value匹配，处理重复）
+func removeCardsFromHand(hand []Card, played []Card) []Card {
+	remaining := make([]Card, 0, len(hand))
+	used := make([]bool, len(hand))
+
+	for _, p := range played {
+		// 找到第一张匹配且尚未被使用的牌
+		found := false
+		for i, h := range hand {
+			if used[i] {
+				continue
+			}
+			if h.Name == p.Name && h.Type == p.Type && h.Value == p.Value {
+				used[i] = true
+				found = true
+				break
+			}
+		}
+		// 如果没有找到完全相同的牌，尝试按 Name+Type 匹配（不严格匹配 value）
+		if !found {
+			for i, h := range hand {
+				if used[i] {
+					continue
+				}
+				if h.Name == p.Name && h.Type == p.Type {
+					used[i] = true
+					found = true
+					break
+				}
+			}
+		}
+	}
+
+	for i, h := range hand {
+		if !used[i] {
+			remaining = append(remaining, h)
+		}
+	}
+	return remaining
+}
+
 func handleGameMessage(room *GameRoom, player *Player, msg GameMessage) {
 	switch msg.Type {
 	case "move":
-		log.Printf("玩家 %s 出牌: %v", player.Name, msg.Cards)
+		log.Printf("玩家 %s 请求出牌: %v", player.Name, msg.Cards)
+		// 校验出牌是否合法，使用 game_rules.go 中的规则
+		valid, reason := isValidMove(room.LastCards, msg.Cards, player.Hand)
+		if !valid {
+			// 发送无效提示给当前玩家
+			errMsg := GameMessage{
+				Type:     "invalid_move",
+				PlayerID: player.ID,
+				Data:     map[string]interface{}{"reason": reason},
+			}
+			data, _ := json.Marshal(errMsg)
+			player.Conn.WriteMessage(websocket.TextMessage, data)
+			log.Printf("玩家 %s 出牌无效: %s", player.Name, reason)
+			return
+		}
+
+		// 移除玩家手牌
+		player.Hand = removeCardsFromHand(player.Hand, msg.Cards)
+
+		// 更新上一手牌
+		room.LastCards = msg.Cards
+		room.LastPlayerID = player.ID
+
+		// 广播玩家出牌
 		room.broadcast(GameMessage{
 			Type:     "player_move",
 			PlayerID: player.ID,
@@ -276,6 +346,16 @@ func handleGameMessage(room *GameRoom, player *Player, msg GameMessage) {
 				"playerName": player.Name,
 			},
 		})
+
+		// 如果玩家手牌为空，宣布胜利（简单处理）
+		if len(player.Hand) == 0 {
+			room.broadcast(GameMessage{
+				Type:     "player_win",
+				PlayerID: player.ID,
+				Data: map[string]interface{}{"playerName": player.Name},
+			})
+		}
+
 	case "fold":
 		log.Printf("玩家 %s 弃牌", player.Name)
 		room.broadcast(GameMessage{
