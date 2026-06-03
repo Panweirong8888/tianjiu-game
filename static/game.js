@@ -3,10 +3,13 @@ class TianJiuGame {
         this.ws = null;
         this.playerID = this.generatePlayerID();
         this.playerName = `玩家${Math.floor(Math.random() * 10000)}`;
+        this.room = this.getRoomFromURL() || 'main';
         this.myCards = [];
         this.selectedCards = [];
         this.otherPlayersCards = [0, 0, 0]; // 其他三个玩家的手牌数
         this.currentRound = 1;
+        this.requiredCount = 0; // 当前本墩需要出的牌数（0表示尚未定）
+        this.starterID = null;
         this.gameLog = [];
         this.cardCanvases = {
             my: document.getElementById('myCardsCanvas'),
@@ -14,12 +17,48 @@ class TianJiuGame {
             left: document.getElementById('leftPlayerCanvas'),
             right: document.getElementById('rightPlayerCanvas')
         };
+        this.initializeToastContainer();
         this.initializeEventListeners();
         this.initializeGame();
     }
 
     generatePlayerID() {
         return `player_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    }
+
+    getRoomFromURL() {
+        try {
+            const params = new URLSearchParams(window.location.search);
+            return params.get('room');
+        } catch (e) {
+            return null;
+        }
+    }
+
+    initializeToastContainer() {
+        if (document.getElementById('toast-container')) return;
+        const container = document.createElement('div');
+        container.id = 'toast-container';
+        container.style.position = 'fixed';
+        container.style.right = '20px';
+        container.style.top = '20px';
+        container.style.zIndex = 9999;
+        document.body.appendChild(container);
+        const style = document.createElement('style');
+        style.innerHTML = `#toast-container .toast{background:rgba(0,0,0,0.75);color:#fff;padding:8px 12px;border-radius:6px;margin-top:8px;min-width:160px;font-family:Arial, Helvetica, sans-serif}`;
+        document.head.appendChild(style);
+    }
+
+    showToast(message, timeout = 3000) {
+        const container = document.getElementById('toast-container');
+        if (!container) return;
+        const el = document.createElement('div');
+        el.className = 'toast';
+        el.textContent = message;
+        container.appendChild(el);
+        setTimeout(() => {
+            if (el.parentNode) container.removeChild(el);
+        }, timeout);
     }
 
     initializeEventListeners() {
@@ -36,13 +75,20 @@ class TianJiuGame {
 
     connectWebSocket() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        this.ws = new WebSocket(
-            `${protocol}//${window.location.host}/ws?id=${this.playerID}&name=${encodeURIComponent(this.playerName)}`
-        );
+        const url = `${protocol}//${window.location.host}/ws?id=${this.playerID}&name=${encodeURIComponent(this.playerName)}&room=${encodeURIComponent(this.room)}`;
+        this.ws = new WebSocket(url);
+        this.reconnectAttempts = 0;
 
         this.ws.onopen = () => {
             this.addLog('已连接到游戏服务器');
             document.getElementById('gameStatus').textContent = '状态: 已连接';
+            this.reconnectAttempts = 0;
+            // 主动请求一次同步（以防这是重连）
+            try {
+                this.ws.send(JSON.stringify({ type: 'sync_request', playerId: this.playerID }));
+            } catch (e) {
+                // ignore
+            }
         };
 
         this.ws.onmessage = (event) => {
@@ -56,8 +102,12 @@ class TianJiuGame {
         };
 
         this.ws.onclose = () => {
-            this.addLog('已断开连接');
+            this.addLog('已断开连接，正在尝试重连');
             document.getElementById('gameStatus').textContent = '状态: 已断开';
+            // 重连策略：指数回退
+            this.reconnectAttempts = (this.reconnectAttempts || 0) + 1;
+            const delay = Math.min(30000, 1000 * Math.pow(2, this.reconnectAttempts));
+            setTimeout(() => this.connectWebSocket(), delay);
         };
     }
 
@@ -146,11 +196,31 @@ class TianJiuGame {
         this.renderMyCards();
     }
 
-    playCards() {
+    // 本地校验：当 requiredCount > 0 且不是自己是首家时，必须选中 requiredCount 张
+    localValidateMove(isFold) {
         if (this.selectedCards.length === 0) {
-            this.addLog('请先选择要出的牌');
-            return;
+            this.addLog('请先选择要出的/弃掉的牌');
+            this.showToast('请先选择要出的/弃掉的牌');
+            return false;
         }
+        if (this.requiredCount > 0 && this.starterID !== this.playerID) {
+            if (this.selectedCards.length !== this.requiredCount) {
+                this.addLog(`必须选择 ${this.requiredCount} 张牌`);
+                this.showToast(`必须选择 ${this.requiredCount} 张牌`);
+                return false;
+            }
+        }
+        // 不能选择超过自己当前手牌数（防御性）
+        if (this.selectedCards.length > this.myCards.length) {
+            this.addLog('选择数量超出手牌数');
+            this.showToast('选择数量超出手牌数');
+            return false;
+        }
+        return true;
+    }
+
+    playCards() {
+        if (!this.localValidateMove(false)) return;
 
         const cards = this.selectedCards.map(i => this.myCards[i]);
         const message = {
@@ -159,21 +229,24 @@ class TianJiuGame {
             cards: cards
         };
 
-        this.ws.send(JSON.stringify(message));
+        try {
+            this.ws.send(JSON.stringify(message));
+        } catch (e) {
+            this.addLog('无法发送出牌请求：未连接');
+            this.showToast('无法发送出牌请求：未连接');
+            return;
+        }
+
         this.addLog(`你出了 ${cards.map(c => c.name).join(' ')}`);
 
-        // 移除出过的牌（本地乐观更新）
+        // 乐观更新：移除出过的牌（本地）
         this.myCards = this.myCards.filter((_, i) => !this.selectedCards.includes(i));
         this.selectedCards = [];
         this.renderMyCards();
     }
 
     foldCards() {
-        if (this.selectedCards.length === 0) {
-            this.addLog('请先选择要弃掉的牌，再点击弃牌');
-            alert('请先选择要弃掉的牌，再点击弃牌');
-            return;
-        }
+        if (!this.localValidateMove(true)) return;
 
         const cards = this.selectedCards.map(i => this.myCards[i]);
         const message = {
@@ -182,10 +255,17 @@ class TianJiuGame {
             cards: cards
         };
 
-        this.ws.send(JSON.stringify(message));
+        try {
+            this.ws.send(JSON.stringify(message));
+        } catch (e) {
+            this.addLog('无法发送弃牌请求：未连接');
+            this.showToast('无法发送弃牌请求：未连接');
+            return;
+        }
+
         this.addLog(`你弃掉了 ${cards.map(c => c.name).join(' ')}`);
 
-        // 移除弃掉的牌（本地乐观更新）
+        // 乐观更新：移除弃掉的牌（本地）
         this.myCards = this.myCards.filter((_, i) => !this.selectedCards.includes(i));
         this.selectedCards = [];
         this.renderMyCards();
@@ -199,13 +279,44 @@ class TianJiuGame {
                 this.sortCards();
                 this.renderMyCards();
                 this.addLog(`游戏开始！服务器为你分配了 ${this.myCards.length} 张牌`);
+                this.showToast('游戏开始！已收到发牌');
+                // reset local trick info
+                this.requiredCount = 0;
+                this.starterID = null;
+                break;
+            case 'sync':
+                // 服务端在重连或请求同步时返回当前手牌
+                if (message.cards) {
+                    this.myCards = message.cards;
+                    this.sortCards();
+                    this.selectedCards = [];
+                    this.renderMyCards();
+                    this.addLog('已与服务器同步手牌');
+                    this.showToast('已与服务器同步手牌');
+                }
+                break;
+            case 'trick_start':
+                // 服务端广播本墩开始和需要出的数量
+                this.requiredCount = message.data && message.data.requiredCount ? message.data.requiredCount : 0;
+                this.starterID = message.data && message.data.starterID ? message.data.starterID : null;
+                if (this.requiredCount > 0) {
+                    this.addLog(`本墩已开始，需要出 ${this.requiredCount} 张，首家: ${this.starterID === this.playerID ? '你' : '他人'}`);
+                    this.showToast(`本墩已开始，需要出 ${this.requiredCount} 张`);
+                }
                 break;
             case 'invalid_move':
                 {
                     const reason = message.data && message.data.reason ? message.data.reason : '出牌无效';
                     this.addLog(`出牌无效：${reason}`);
-                    alert(`出牌无效：${reason}`);
-                    this.flashInvalidSelection();
+                    this.showToast(`出牌无效：${reason}`);
+                    // 如果服务器带回真实手牌，自动回滚本地乐观更新
+                    if (message.data && message.data.hand) {
+                        this.myCards = message.data.hand;
+                        this.selectedCards = [];
+                        this.sortCards();
+                        this.renderMyCards();
+                        this.addLog('已根据服务器返回手牌回滚本地状态');
+                    }
                 }
                 break;
             case 'round_start':
@@ -220,10 +331,14 @@ class TianJiuGame {
                 break;
             case 'round_result':
                 this.addLog(`${message.data.playerName} 赢得了这一轮`);
+                this.showToast(`${message.data.playerName} 赢得了这一轮`);
+                // 重置本墩本地状态
+                this.requiredCount = 0;
+                this.starterID = null;
                 break;
             case 'player_win':
                 this.addLog(`${message.data.playerName} 获胜！`);
-                alert(`${message.data.playerName} 获胜！`);
+                this.showToast(`${message.data.playerName} 获胜！`);
                 break;
             default:
                 this.addLog(`收到消息：${JSON.stringify(message)}`);
