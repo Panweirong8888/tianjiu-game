@@ -27,20 +27,25 @@ type Card struct {
 }
 
 type Player struct {
-	ID   string
-	Name string
-	Conn *websocket.Conn
-	Hand []Card
+	ID     string
+	Name   string
+	Conn   *websocket.Conn
+	Hand   []Card
+	WinCnt int // 赢的轮数，用于最后一轮判断资格
 }
 
 type GameRoom struct {
-	Players      map[string]*Player
-	AllCards     []Card
-	CurrentRound int
-	Banker       int
-	LastCards    []Card // 上一位玩家出的牌
-	LastPlayerID string
-	mutex        sync.RWMutex
+	Players        map[string]*Player
+	AllCards       []Card
+	CurrentRound   int
+	Banker         int
+	LastCards      []Card            // 本轮基准牌（首家出的牌）
+	StarterID      string            // 本轮首家ID
+	RequiredCount  int               // 本轮出牌数量基数
+	PlayersActed   map[string]bool   // 本轮已操作的玩家
+	PlayedCards    map[string][]Card // 本轮每位玩家出的牌（若弃牌则不存在）
+	FoldedPlayers  map[string]bool   // 本轮弃牌的玩家
+	mutex          sync.RWMutex
 }
 
 type GameMessage struct {
@@ -189,6 +194,16 @@ func (r *GameRoom) shuffleDeck() {
 	}
 }
 
+// 重置本轮状态
+func (r *GameRoom) resetTrick() {
+	r.LastCards = nil
+	r.StarterID = ""
+	r.RequiredCount = 0
+	r.PlayersActed = make(map[string]bool)
+	r.PlayedCards = make(map[string][]Card)
+	r.FoldedPlayers = make(map[string]bool)
+}
+
 // 发牌给4个玩家，每个玩家8张 (32张牌完全分配，不重复)
 func (r *GameRoom) dealCards() {
 	r.mutex.Lock()
@@ -200,9 +215,10 @@ func (r *GameRoom) dealCards() {
 	// 洗牌
 	r.shuffleDeck()
 
-	// 清空玩家手牌
+	// 清空玩家手牌并重置胜利计数
 	for _, player := range r.Players {
 		player.Hand = []Card{}
+		player.WinCnt = 0
 	}
 
 	// 将玩家转换为有序列表 (保证发牌顺序一致)
@@ -222,9 +238,8 @@ func (r *GameRoom) dealCards() {
 		}
 	}
 
-	// 初始化上一轮牌为空
-	r.LastCards = nil
-	r.LastPlayerID = ""
+	// 重置轮状态
+	r.resetTrick()
 
 	log.Printf("发牌完成！共发出 %d 张牌", cardIndex)
 	for i, p := range playerList {
@@ -311,59 +326,292 @@ func removeCardsFromHand(hand []Card, played []Card) []Card {
 	return remaining
 }
 
+// 比较两名玩家在本轮的牌大小，考虑至尊特殊规则
+// 返回 1 if a>b, -1 if a<b, 0 if equal
+func compareForTrick(aCards []Card, aID string, bCards []Card, bID string, starterID string) int {
+	comboA := getCardCombinationType(aCards)
+	comboB := getCardCombinationType(bCards)
+
+	// 类型必须相同才能比较（在游戏流里应已被强制）
+	if comboA.Type != comboB.Type {
+		return 0
+	}
+
+	// 至尊特殊处理：如果某方是至尊
+	if comboA.Type == TYPE_SUPREME || comboB.Type == TYPE_SUPREME {
+		// 如果A是至尊
+		if comboA.Type == TYPE_SUPREME && comboB.Type == TYPE_SUPREME {
+			// 罕见：同时为至尊，按照starter优先
+			if aID == starterID && bID != starterID {
+				return 1
+			} else if bID == starterID && aID != starterID {
+				return -1
+			}
+			return 0
+		}
+		if comboA.Type == TYPE_SUPREME {
+			if aID == starterID {
+				return 1
+			}
+			return -1
+		}
+		if comboB.Type == TYPE_SUPREME {
+			if bID == starterID {
+				return -1
+			}
+			return 1
+		}
+	}
+
+	// 其余按 Rank 比较
+	if comboA.Rank > comboB.Rank {
+		return 1
+	} else if comboA.Rank < comboB.Rank {
+		return -1
+	}
+	return 0
+}
+
 func handleGameMessage(room *GameRoom, player *Player, msg GameMessage) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
 	switch msg.Type {
 	case "move":
 		log.Printf("玩家 %s 请求出牌: %v", player.Name, msg.Cards)
-		// 校验出牌是否合法，使用 game_rules.go 中的规则
-		valid, reason := isValidMove(room.LastCards, msg.Cards, player.Hand)
-		if !valid {
-			// 发送无效提示给当前玩家
-			errMsg := GameMessage{
-				Type:     "invalid_move",
-				PlayerID: player.ID,
-				Data:     map[string]interface{}{"reason": reason},
-			}
+
+		// 检查玩家是否已经在本轮行动
+		if room.PlayersActed == nil {
+			room.PlayersActed = make(map[string]bool)
+		}
+		if room.PlayedCards == nil {
+			room.PlayedCards = make(map[string][]Card)
+		}
+		if room.FoldedPlayers == nil {
+			room.FoldedPlayers = make(map[string]bool)
+		}
+
+		if room.PlayersActed[player.ID] {
+			// 已经行动过
+			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "您本轮已行动，不能重复出牌或弃牌"}}
 			data, _ := json.Marshal(errMsg)
 			player.Conn.WriteMessage(websocket.TextMessage, data)
-			log.Printf("玩家 %s 出牌无效: %s", player.Name, reason)
 			return
 		}
 
-		// 移除玩家手牌
-		player.Hand = removeCardsFromHand(player.Hand, msg.Cards)
+		// 如果还没有首家出牌，本次出牌为首家
+		if room.RequiredCount == 0 {
+			// 首家出牌，设置本轮参数
+			room.RequiredCount = len(msg.Cards)
+			room.LastCards = msg.Cards
+			room.StarterID = player.ID
 
-		// 更新上一手牌
-		room.LastCards = msg.Cards
-		room.LastPlayerID = player.ID
+			// 特殊规则：如果这是单张决胜轮（每位玩家手牌数均为1），只有曾获胜过的玩家可出单张
+			allOne := true
+			for _, p := range room.Players {
+				if len(p.Hand) != 1 {
+					allOne = false
+					break
+				}
+			}
+			if allOne && room.RequiredCount == 1 && player.WinCnt == 0 {
+				// 不允许出单张
+				errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "无资格出单张，需弃牌（前轮未赢过）"}}
+				data, _ := json.Marshal(errMsg)
+				player.Conn.WriteMessage(websocket.TextMessage, data)
+				return
+			}
+
+			// 验证首家出的牌是否合法（仅验证组合合法性）
+			valid, reason := isValidMove(nil, msg.Cards, player.Hand)
+			if !valid {
+				errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": reason}}
+				data, _ := json.Marshal(errMsg)
+				player.Conn.WriteMessage(websocket.TextMessage, data)
+				return
+			}
+
+			// 记录首家出的牌
+			room.PlayedCards[player.ID] = msg.Cards
+			room.PlayersActed[player.ID] = true
+			// 移除玩家手牌
+			player.Hand = removeCardsFromHand(player.Hand, msg.Cards)
+		} else {
+			// 非首家出牌，必须出相同数量
+			if len(msg.Cards) != room.RequiredCount {
+				errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "出牌数量必须与首家一致"}}
+				data, _ := json.Marshal(errMsg)
+				player.Conn.WriteMessage(websocket.TextMessage, data)
+				return
+			}
+
+			// 如果这是单张决胜轮，检查资格
+			if room.RequiredCount == 1 {
+				allOne := true
+				for _, p := range room.Players {
+					if len(p.Hand) != 1 {
+						allOne = false
+						break
+					}
+				}
+				if allOne && player.WinCnt == 0 {
+					errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "无资格出单张，需弃牌（前轮未赢过）"}}
+					data, _ := json.Marshal(errMsg)
+					player.Conn.WriteMessage(websocket.TextMessage, data)
+					return
+				}
+			}
+
+			// 验证出牌是否合法（与首家比较）
+			valid, reason := isValidMove(room.LastCards, msg.Cards, player.Hand)
+			if !valid {
+				errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": reason}}
+				data, _ := json.Marshal(errMsg)
+				player.Conn.WriteMessage(websocket.TextMessage, data)
+				return
+			}
+
+			// 记录玩家出牌并移除手牌
+			room.PlayedCards[player.ID] = msg.Cards
+			room.PlayersActed[player.ID] = true
+			player.Hand = removeCardsFromHand(player.Hand, msg.Cards)
+		}
 
 		// 广播玩家出牌
-		room.broadcast(GameMessage{
-			Type:     "player_move",
-			PlayerID: player.ID,
-			Cards:    msg.Cards,
-			Data: map[string]interface{}{
-				"playerName": player.Name,
-			},
-		})
+		room.broadcast(GameMessage{Type: "player_move", PlayerID: player.ID, Cards: msg.Cards, Data: map[string]interface{}{"playerName": player.Name}})
 
-		// 如果玩家手牌为空，宣布胜利（简单处理）
-		if len(player.Hand) == 0 {
-			room.broadcast(GameMessage{
-				Type:     "player_win",
-				PlayerID: player.ID,
-				Data: map[string]interface{}{"playerName": player.Name},
-			})
+		// 检查本轮是否所有玩家都已行动
+		if len(room.PlayersActed) == len(room.Players) {
+			// 评估本轮赢家
+			winnerID := ""
+			var winnerCards []Card
+			// 找到首家在played order中的一项作为初始赢家
+			if cards, ok := room.PlayedCards[room.StarterID]; ok {
+				winnerID = room.StarterID
+				winnerCards = cards
+			} else {
+				// 如果首家弃牌（理论上首家不应弃牌），从任意已出玩家中选一个开始
+				for pid, cards := range room.PlayedCards {
+					winnerID = pid
+					winnerCards = cards
+					break
+				}
+			}
+
+			for pid, cards := range room.PlayedCards {
+				if pid == winnerID {
+					continue
+				}
+				cmp := compareForTrick(cards, pid, winnerCards, winnerID, room.StarterID)
+				if cmp == 1 {
+					winnerID = pid
+					winnerCards = cards
+				}
+			}
+
+			// 宣布赢家
+			if winnerID != "" {
+				winner := room.Players[winnerID]
+				winner.WinCnt++
+				room.broadcast(GameMessage{Type: "round_result", PlayerID: winnerID, Data: map[string]interface{}{"playerName": winner.Name}})
+				log.Printf("本轮赢家: %s", winner.Name)
+				// 下一轮由赢家先出
+				r.resetTrick()
+				room.StarterID = winnerID
+			} else {
+				// 所有人都弃牌？重置并下一轮由上轮starter继续先出
+				r.resetTrick()
+			}
 		}
 
 	case "fold":
-		log.Printf("玩家 %s 弃牌", player.Name)
-		room.broadcast(GameMessage{
-			Type:     "player_fold",
-			PlayerID: player.ID,
-			Data: map[string]interface{}{
-				"playerName": player.Name,
-			},
-		})
+		log.Printf("玩家 %s 请求弃牌: %v", player.Name, msg.Cards)
+
+		if room.PlayersActed == nil {
+			room.PlayersActed = make(map[string]bool)
+		}
+		if room.FoldedPlayers == nil {
+			room.FoldedPlayers = make(map[string]bool)
+		}
+		if room.RequiredCount == 0 {
+			// 无法在首家之前弃牌
+			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "本轮尚未开始，不能弃牌"}}
+			data, _ := json.Marshal(errMsg)
+			player.Conn.WriteMessage(websocket.TextMessage, data)
+			return
+		}
+
+		if room.PlayersActed[player.ID] {
+			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "您本轮已行动，不能重复弃牌"}}
+			data, _ := json.Marshal(errMsg)
+			player.Conn.WriteMessage(websocket.TextMessage, data)
+			return
+		}
+
+		// 要弃牌的数量必须等于 RequiredCount
+		if len(msg.Cards) != room.RequiredCount {
+			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "弃牌数量必须等于本轮出牌数量"}}
+			data, _ := json.Marshal(errMsg)
+			player.Conn.WriteMessage(websocket.TextMessage, data)
+			return
+		}
+
+		// 验证玩家手中是否有这些牌
+		// 简单调用 removeCardsFromHand 并比对长度
+		remaining := removeCardsFromHand(player.Hand, msg.Cards)
+		if len(remaining) == len(player.Hand) {
+			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "弃牌中包含无效牌或数量不正确"}}
+			data, _ := json.Marshal(errMsg)
+			player.Conn.WriteMessage(websocket.TextMessage, data)
+			return
+		}
+
+		// 确认弃牌并移除
+		player.Hand = remaining
+		room.PlayersActed[player.ID] = true
+		room.FoldedPlayers[player.ID] = true
+
+		// 广播弃牌
+		room.broadcast(GameMessage{Type: "player_fold", PlayerID: player.ID, Data: map[string]interface{}{"playerName": player.Name}})
+
+		// 检查本轮是否所有玩家都已行动
+		if len(room.PlayersActed) == len(room.Players) {
+			// 同上评估赢家
+			winnerID := ""
+			var winnerCards []Card
+			if cards, ok := room.PlayedCards[room.StarterID]; ok {
+				winnerID = room.StarterID
+				winnerCards = cards
+			} else {
+				for pid, cards := range room.PlayedCards {
+					winnerID = pid
+					winnerCards = cards
+					break
+				}
+			}
+
+			for pid, cards := range room.PlayedCards {
+				if pid == winnerID {
+					continue
+				}
+				cmp := compareForTrick(cards, pid, winnerCards, winnerID, room.StarterID)
+				if cmp == 1 {
+					winnerID = pid
+					winnerCards = cards
+				}
+			}
+
+			if winnerID != "" {
+				winner := room.Players[winnerID]
+				winner.WinCnt++
+				room.broadcast(GameMessage{Type: "round_result", PlayerID: winnerID, Data: map[string]interface{}{"playerName": winner.Name}})
+				log.Printf("本轮赢家: %s", winner.Name)
+				r.resetTrick()
+				room.StarterID = winnerID
+			} else {
+				r.resetTrick()
+			}
+		}
+
 	}
 }
