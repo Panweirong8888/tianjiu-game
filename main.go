@@ -87,6 +87,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	playerID := r.URL.Query().Get("id")
 	playerName := r.URL.Query().Get("name")
+	roomID := r.URL.Query().Get("room")
+	if roomID == "" {
+		roomID = "main"
+	}
+
+	room := getOrCreateRoom(roomID)
 
 	player := &Player{
 		ID:   playerID,
@@ -94,11 +100,19 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		Conn: conn,
 	}
 
-	// 将玩家加入房间 (简单实现：所有玩家在同一个房间)
-	room := getOrCreateRoom("main")
-	room.addPlayer(player)
+	// 如果同一个 playerID 已存在，视为重连，替换 conn
+	room.mutex.Lock()
+	if existing, ok := room.Players[playerID]; ok {
+		log.Printf("玩家 %s 重连，替换连接", existing.Name)
+		existing.Conn = conn
+		player = existing
+	} else {
+		room.Players[playerID] = player
+		log.Printf("玩家 %s 加入房间 %s，当前玩家数: %d", player.Name, roomID, len(room.Players))
+	}
+	room.mutex.Unlock()
 
-	// 当有4个玩家时，开始发牌
+	// 当有4个玩家时，开始发牌（仅当牌尚未发放或玩家刚好达到4人）
 	if len(room.Players) == 4 {
 		room.dealCards()
 		room.broadcastDealCards()
@@ -111,7 +125,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("WebSocket错误: %v", err)
 			}
-			room.removePlayer(playerID)
+			// 在连接关闭时，不立即删除玩家，保留玩家信息以便重连
 			break
 		}
 
@@ -393,7 +407,7 @@ func handleGameMessage(room *GameRoom, player *Player, msg GameMessage) {
 
 		if room.PlayersActed[player.ID] {
 			// 已经行动过
-			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "您本轮已行动，不能重复出牌或弃牌"}}
+			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "您本轮已行动，不能重复出牌或弃牌", "hand": player.Hand}}
 			data, _ := json.Marshal(errMsg)
 			player.Conn.WriteMessage(websocket.TextMessage, data)
 			return
@@ -416,7 +430,7 @@ func handleGameMessage(room *GameRoom, player *Player, msg GameMessage) {
 			}
 			if allOne && room.RequiredCount == 1 && player.WinCnt == 0 {
 				// 不允许出单张
-				errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "无资格出单张，需弃牌（前轮未赢过）"}}
+				errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "无资格出单张，需弃牌（前轮未赢过）", "hand": player.Hand}}
 				data, _ := json.Marshal(errMsg)
 				player.Conn.WriteMessage(websocket.TextMessage, data)
 				return
@@ -425,7 +439,7 @@ func handleGameMessage(room *GameRoom, player *Player, msg GameMessage) {
 			// 验证首家出的牌是否合法（仅验证组合合法性）
 			valid, reason := isValidMove(nil, msg.Cards, player.Hand)
 			if !valid {
-				errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": reason}}
+				errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": reason, "hand": player.Hand}}
 				data, _ := json.Marshal(errMsg)
 				player.Conn.WriteMessage(websocket.TextMessage, data)
 				return
@@ -439,7 +453,7 @@ func handleGameMessage(room *GameRoom, player *Player, msg GameMessage) {
 		} else {
 			// 非首家出牌，必须出相同数量
 			if len(msg.Cards) != room.RequiredCount {
-				errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "出牌数量必须与首家一致"}}
+				errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "出牌数量必须与首家一致", "hand": player.Hand}}
 				data, _ := json.Marshal(errMsg)
 				player.Conn.WriteMessage(websocket.TextMessage, data)
 				return
@@ -455,7 +469,7 @@ func handleGameMessage(room *GameRoom, player *Player, msg GameMessage) {
 					}
 				}
 				if allOne && player.WinCnt == 0 {
-					errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "无资格出单张，需弃牌（前轮未赢过）"}}
+					errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "无资格出单张，需弃牌（前轮未赢过）", "hand": player.Hand}}
 					data, _ := json.Marshal(errMsg)
 					player.Conn.WriteMessage(websocket.TextMessage, data)
 					return
@@ -465,7 +479,7 @@ func handleGameMessage(room *GameRoom, player *Player, msg GameMessage) {
 			// 验证出牌是否合法（与首家比较）
 			valid, reason := isValidMove(room.LastCards, msg.Cards, player.Hand)
 			if !valid {
-				errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": reason}}
+				errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": reason, "hand": player.Hand}}
 				data, _ := json.Marshal(errMsg)
 				player.Conn.WriteMessage(websocket.TextMessage, data)
 				return
@@ -535,14 +549,14 @@ func handleGameMessage(room *GameRoom, player *Player, msg GameMessage) {
 		}
 		if room.RequiredCount == 0 {
 			// 无法在首家之前弃牌
-			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "本轮尚未开始，不能弃牌"}}
+			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "本轮尚未开始，不能弃牌", "hand": player.Hand}}
 			data, _ := json.Marshal(errMsg)
 			player.Conn.WriteMessage(websocket.TextMessage, data)
 			return
 		}
 
 		if room.PlayersActed[player.ID] {
-			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "您本轮已行动，不能重复弃牌"}}
+			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "您本轮已行动，不能重复弃牌", "hand": player.Hand}}
 			data, _ := json.Marshal(errMsg)
 			player.Conn.WriteMessage(websocket.TextMessage, data)
 			return
@@ -550,7 +564,7 @@ func handleGameMessage(room *GameRoom, player *Player, msg GameMessage) {
 
 		// 要弃牌的数量必须等于 RequiredCount
 		if len(msg.Cards) != room.RequiredCount {
-			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "弃牌数量必须等于本轮出牌数量"}}
+			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "弃牌数量必须等于本轮出牌数量", "hand": player.Hand}}
 			data, _ := json.Marshal(errMsg)
 			player.Conn.WriteMessage(websocket.TextMessage, data)
 			return
@@ -560,7 +574,7 @@ func handleGameMessage(room *GameRoom, player *Player, msg GameMessage) {
 		// 简单调用 removeCardsFromHand 并比对长度
 		remaining := removeCardsFromHand(player.Hand, msg.Cards)
 		if len(remaining) == len(player.Hand) {
-			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "弃牌中包含无效牌或数量不正确"}}
+			errMsg := GameMessage{Type: "invalid_move", PlayerID: player.ID, Data: map[string]interface{}{"reason": "弃牌中包含无效牌或数量不正确", "hand": player.Hand}}
 			data, _ := json.Marshal(errMsg)
 			player.Conn.WriteMessage(websocket.TextMessage, data)
 			return
