@@ -62,20 +62,63 @@ class TianJiuGame {
         };
     }
 
-    generateInitialCards() {
-        const cardNames = ['天', '地', '人', '鹅', '梅', '长三', '板凳', '斧头', '红头十', '高脚七', '铃铛六'];
-        const blackNames = ['九', '八', '七', '六公', '五', '生鸡'];
+    // 创建完整的牌库 (32张牌)
+    createDeck() {
+        const deck = [];
+        
+        // 文子: 天、地、人、鹅、梅、长三、板凳、斧头、红头十、高脚七、铃铛六 (每种2张)
+        const winCards = [
+            { name: '天', type: '文', value: 11 },
+            { name: '地', type: '文', value: 10 },
+            { name: '人', type: '文', value: 9 },
+            { name: '鹅', type: '文', value: 8 },
+            { name: '梅', type: '文', value: 7 },
+            { name: '长三', type: '文', value: 6 },
+            { name: '板凳', type: '文', value: 5 },
+            { name: '斧头', type: '文', value: 4 },
+            { name: '红头十', type: '文', value: 3 },
+            { name: '高脚七', type: '文', value: 2 },
+            { name: '铃铛六', type: '文', value: 1 }
+        ];
 
-        // 模拟获得初始手牌 (8张)
-        for (let i = 0; i < 8; i++) {
-            if (Math.random() > 0.5) {
-                const name = cardNames[Math.floor(Math.random() * cardNames.length)];
-                this.myCards.push({ name, type: '文', value: 10 - Math.random() });
-            } else {
-                const name = blackNames[Math.floor(Math.random() * blackNames.length)];
-                this.myCards.push({ name, type: '黑', value: 5 - Math.random() });
-            }
+        winCards.forEach(card => {
+            deck.push(JSON.parse(JSON.stringify(card)));\n            deck.push(JSON.parse(JSON.stringify(card)));\n        });
+
+        // 黑子: 九(2张)、八(2张)、七(2张)、六公(1张)、五(2张)、生鸡(1张)
+        const blackCards = [
+            { name: '九', type: '黑', value: 5 },
+            { name: '九', type: '黑', value: 5 },
+            { name: '八', type: '黑', value: 4 },
+            { name: '八', type: '黑', value: 4 },
+            { name: '七', type: '黑', value: 3 },
+            { name: '七', type: '黑', value: 3 },
+            { name: '六公', type: '黑', value: 2 },
+            { name: '五', type: '黑', value: 1 },
+            { name: '五', type: '黑', value: 1 },
+            { name: '生鸡', type: '黑', value: 0 }
+        ];
+
+        deck.push(...blackCards);
+        return deck;
+    }
+
+    // 从牌库中随机抽取指定数量的牌
+    drawCards(deck, count) {
+        const drawn = [];
+        for (let i = 0; i < count && deck.length > 0; i++) {
+            const randomIndex = Math.floor(Math.random() * deck.length);
+            drawn.push(deck[randomIndex]);
+            deck.splice(randomIndex, 1);
         }
+        return drawn;
+    }
+
+    generateInitialCards() {
+        // 创建完整的牌库
+        const deck = this.createDeck();
+        
+        // 从牌库中随机抽取8张牌
+        this.myCards = this.drawCards(deck, 8);
 
         this.sortCards();
         this.renderMyCards();
@@ -88,7 +131,7 @@ class TianJiuGame {
             if (a.type !== b.type) {
                 return a.type === '文' ? -1 : 1;
             }
-            // 再按大小排序
+            // 再按大小排序 (从大到小)
             return b.value - a.value;
         });
     }
@@ -262,7 +305,7 @@ class TianJiuGame {
     }
 }
 
-// 初始化游戏
+// 初始化���戏
 window.addEventListener('DOMContentLoaded', () => {
     new TianJiuGame();
 });
