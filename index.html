@@ -14,6 +14,14 @@
                 <span id="playerName">玩家: 未连接</span>
                 <span id="gameStatus">状态: 等待中</span>
             </div>
+            <!-- 房间控制 -->
+            <div class="room-controls" style="margin-top:8px;">
+                <input id="roomInput" placeholder="输入房间名，例如: room1" style="padding:6px;border-radius:4px;border:1px solid #ccc;" />
+                <button id="joinRoomBtn" class="btn">加入房间</button>
+                <button id="createRoomBtn" class="btn">创建房间</button>
+                <button id="reconnectBtn" class="btn">手动重连</button>
+                <span id="currentRoom" style="margin-left:12px;font-weight:600;">房间: main</span>
+            </div>
         </div>
 
         <div class="game-board">
@@ -69,5 +77,39 @@
     </div>
 
     <script src="/static/game.js"></script>
+    <script>
+        // 绑定房间 UI 与页面交互（简单实现：跳转到带 ?room= 的页面）
+        document.addEventListener('DOMContentLoaded', function() {
+            const roomInput = document.getElementById('roomInput');
+            const joinBtn = document.getElementById('joinRoomBtn');
+            const createBtn = document.getElementById('createRoomBtn');
+            const reconnectBtn = document.getElementById('reconnectBtn');
+            const currentRoomSpan = document.getElementById('currentRoom');
+
+            function getRoomFromURL() {
+                try {
+                    const params = new URLSearchParams(window.location.search);
+                    return params.get('room') || 'main';
+                } catch (e) { return 'main'; }
+            }
+            currentRoomSpan.textContent = '房间: ' + getRoomFromURL();
+
+            joinBtn.addEventListener('click', () => {
+                const room = roomInput.value.trim();
+                if (!room) { alert('请输入房间名'); return; }
+                window.location.search = '?room=' + encodeURIComponent(room);
+            });
+            createBtn.addEventListener('click', () => {
+                const room = roomInput.value.trim();
+                if (!room) { alert('请输入房间名'); return; }
+                // 创建房间即加入（服务器端房间会在第一次加入时创建）
+                window.location.search = '?room=' + encodeURIComponent(room);
+            });
+            reconnectBtn.addEventListener('click', () => {
+                // 简单的重连：刷新页面保留 room 参数
+                location.reload();
+            });
+        });
+    </script>
 </body>
 </html>
