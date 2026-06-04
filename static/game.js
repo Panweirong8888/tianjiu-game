@@ -10,6 +10,7 @@ class TianJiuGame {
         this.currentRound = 1;
         this.requiredCount = 0; // 当前本墩需要出的牌数（0表示尚未定）
         this.starterID = null;
+        this.hasActed = false; // 本轮是否已操作（出牌或弃牌）
         this.gameLog = [];
         this.cardCanvases = {
             my: document.getElementById('myCardsCanvas'),
@@ -66,10 +67,19 @@ class TianJiuGame {
         document.getElementById('foldBtn').addEventListener('click', () => this.foldCards());
         document.getElementById('clearBtn').addEventListener('click', () => this.clearSelection());
         document.getElementById('myCardsCanvas').addEventListener('click', (e) => this.handleCardClick(e));
+
+        // 房间控制按钮
+        const joinBtn = document.getElementById('joinRoomBtn');
+        const createBtn = document.getElementById('createRoomBtn');
+        const reconnectBtn = document.getElementById('reconnectBtn');
+        if (joinBtn) joinBtn.addEventListener('click', () => {/* 页面跳转由 index.html 处理 */});
+        if (createBtn) createBtn.addEventListener('click', () => {/* 页面跳转由 index.html 处理 */});
+        if (reconnectBtn) reconnectBtn.addEventListener('click', () => { location.reload(); });
     }
 
     initializeGame() {
         document.getElementById('playerName').textContent = `玩家: ${this.playerName}`;
+        document.getElementById('currentRoom').textContent = '房间: ' + this.room;
         this.connectWebSocket();
     }
 
@@ -83,6 +93,8 @@ class TianJiuGame {
             this.addLog('已连接到游戏服务器');
             document.getElementById('gameStatus').textContent = '状态: 已连接';
             this.reconnectAttempts = 0;
+            this.hasActed = false; // 新连接视为可以操作
+            this.enableActionButtons(true);
             // 主动请求一次同步（以防这是重连）
             try {
                 this.ws.send(JSON.stringify({ type: 'sync_request', playerId: this.playerID }));
@@ -104,11 +116,19 @@ class TianJiuGame {
         this.ws.onclose = () => {
             this.addLog('已断开连接，正在尝试重连');
             document.getElementById('gameStatus').textContent = '状态: 已断开';
+            this.enableActionButtons(false);
             // 重连策略：指数回退
             this.reconnectAttempts = (this.reconnectAttempts || 0) + 1;
             const delay = Math.min(30000, 1000 * Math.pow(2, this.reconnectAttempts));
             setTimeout(() => this.connectWebSocket(), delay);
         };
+    }
+
+    enableActionButtons(enable) {
+        const playBtn = document.getElementById('playBtn');
+        const foldBtn = document.getElementById('foldBtn');
+        if (playBtn) playBtn.disabled = !enable;
+        if (foldBtn) foldBtn.disabled = !enable;
     }
 
     sortCards() {
@@ -198,6 +218,11 @@ class TianJiuGame {
 
     // 本地校验：当 requiredCount > 0 且不是自己是首家时，必须选中 requiredCount 张
     localValidateMove(isFold) {
+        if (this.hasActed) {
+            this.addLog('您本轮已操作，不能再次出牌或弃牌');
+            this.showToast('您本轮已操作，不能再次出牌或弃牌');
+            return false;
+        }
         if (this.selectedCards.length === 0) {
             this.addLog('请先选择要出的/弃掉的牌');
             this.showToast('请先选择要出的/弃掉的牌');
@@ -239,10 +264,12 @@ class TianJiuGame {
 
         this.addLog(`你出了 ${cards.map(c => c.name).join(' ')}`);
 
-        // 乐观更新：移除出过的牌（本地）
+        // 乐观更新：移除出过的牌（本地）并标记已操作，禁用操作按钮
         this.myCards = this.myCards.filter((_, i) => !this.selectedCards.includes(i));
         this.selectedCards = [];
         this.renderMyCards();
+        this.hasActed = true;
+        this.enableActionButtons(false);
     }
 
     foldCards() {
@@ -265,10 +292,12 @@ class TianJiuGame {
 
         this.addLog(`你弃掉了 ${cards.map(c => c.name).join(' ')}`);
 
-        // 乐观更新：移除弃掉的牌（本地）
+        // 乐观更新：移除弃掉的牌（本地）并标记已操作，禁用操作按钮
         this.myCards = this.myCards.filter((_, i) => !this.selectedCards.includes(i));
         this.selectedCards = [];
         this.renderMyCards();
+        this.hasActed = true;
+        this.enableActionButtons(false);
     }
 
     handleGameMessage(message) {
@@ -283,6 +312,8 @@ class TianJiuGame {
                 // reset local trick info
                 this.requiredCount = 0;
                 this.starterID = null;
+                this.hasActed = false;
+                this.enableActionButtons(true);
                 break;
             case 'sync':
                 // 服务端在重连或请求同步时返回当前手牌
@@ -293,6 +324,8 @@ class TianJiuGame {
                     this.renderMyCards();
                     this.addLog('已与服务器同步手牌');
                     this.showToast('已与服务器同步手牌');
+                    this.hasActed = false;
+                    this.enableActionButtons(true);
                 }
                 break;
             case 'trick_start':
@@ -303,6 +336,9 @@ class TianJiuGame {
                     this.addLog(`本墩已开始，需要出 ${this.requiredCount} 张，首家: ${this.starterID === this.playerID ? '你' : '他人'}`);
                     this.showToast(`本墩已开始，需要出 ${this.requiredCount} 张`);
                 }
+                // 新墩开始，重置已操作标记并启用按钮
+                this.hasActed = false;
+                this.enableActionButtons(true);
                 break;
             case 'invalid_move':
                 {
@@ -316,6 +352,15 @@ class TianJiuGame {
                         this.sortCards();
                         this.renderMyCards();
                         this.addLog('已根据服务器返回手牌回滚本地状态');
+                    }
+                    // 如果无资格已操作（服务器提示已行动），保持已操作状态并禁用按钮；
+                    // 否则允许玩家重新操作
+                    if (reason && reason.indexOf('已行动') > -1) {
+                        this.hasActed = true;
+                        this.enableActionButtons(false);
+                    } else {
+                        this.hasActed = false;
+                        this.enableActionButtons(true);
                     }
                 }
                 break;
@@ -335,6 +380,8 @@ class TianJiuGame {
                 // 重置本墩本地状态
                 this.requiredCount = 0;
                 this.starterID = null;
+                this.hasActed = false;
+                this.enableActionButtons(true);
                 break;
             case 'player_win':
                 this.addLog(`${message.data.playerName} 获胜！`);
